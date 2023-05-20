@@ -1,11 +1,10 @@
 import numpy
 import torch
-from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
 from PIL import Image
-import copy
 import gradio as gr
 
+from scripts.safety_checker import CustomSafetyChecker
 from modules import scripts, script_callbacks, shared
 
 safety_model_id = "CompVis/stable-diffusion-safety-checker"
@@ -14,6 +13,7 @@ safety_checker = None
 
 def on_ui_settings():
     shared.opts.add_option("nsfw_censor_enable", shared.OptionInfo(True, "Enable NSFW Censor", section=("nsfw_censor", "NSFW Censor")))
+    shared.opts.add_option("nsfw_censor_safety_chekcer_adjustment", shared.OptionInfo(0, "Safety Checker adjustment", gr.Slider, {"minimum": -0.1, "maximum": 5, "step": 0.001}, section=("nsfw_censor", "NSFW Censor")))
     shared.opts.add_option("nsfw_censor_mosaic_intensity", shared.OptionInfo(64, "Mosaic intensity", gr.Slider, {"minimum": 0, "maximum": 256, "step": 1}, section=("nsfw_censor", "NSFW Censor")))
 
 script_callbacks.on_ui_settings(on_ui_settings)
@@ -43,34 +43,37 @@ def censor(x):
 def check_safety(x_image):
     global safety_feature_extractor, safety_checker
 
+    adjustment = shared.opts.nsfw_censor_safety_chekcer_adjustment
+
     if safety_feature_extractor is None:
         safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
-        safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
+        safety_checker = CustomSafetyChecker.from_pretrained(safety_model_id)
 
     safety_checker_input = safety_feature_extractor(numpy_to_pil(x_image), return_tensors="pt")
-    x_checked_image, has_nsfw_concept = safety_checker(images=x_image, clip_input=safety_checker_input.pixel_values)
+    has_nsfw_concept = safety_checker(
+        images=x_image,
+        clip_input=safety_checker_input.pixel_values,
+        adjustment=adjustment
+    )
 
-    return x_checked_image, has_nsfw_concept
+    return has_nsfw_concept
 
 
-def censor_batch(_x):
-    x = copy.deepcopy(_x)
+def censor_batch(x):
     x_samples_ddim_numpy = x.cpu().permute(0, 2, 3, 1).numpy()
-    _x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim_numpy)
+    has_nsfw_concept = check_safety(x_samples_ddim_numpy)
 
-    pils = numpy_to_pil(_x.cpu().permute(0, 2, 3, 1).numpy())
-    index = 0
-    for h in has_nsfw_concept:
+    pils = numpy_to_pil(x_samples_ddim_numpy)
+
+    for i, has_nsfw in enumerate(has_nsfw_concept):
         try:
-            if h is True:
-                censored = pil_to_numpy(censor(pils[index]))
-                _x[index] = torch.unsqueeze(torch.from_numpy(censored),0).permute(0, 3, 1, 2)
+            if has_nsfw is True:
+                censored = pil_to_numpy(censor(pils[i]))
+                x[i] = torch.unsqueeze(torch.from_numpy(censored),0).permute(0, 3, 1, 2)
         except:
             pass
-        finally:
-            index += 1
 
-    return _x
+    return x
 
 class NsfwCheckScript(scripts.Script):
     def title(self):
